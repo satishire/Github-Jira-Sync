@@ -1,53 +1,133 @@
-name: Create GitHub issue from Jira
+name: Sync Jira status to GitHub
 
 on:
   repository_dispatch:
-    types: [jira_in_progress]
+    types: [jira_in_progress, jira_status_changed]
 
 jobs:
-  create-issue:
+  sync-status:
     runs-on: ubuntu-latest
     permissions:
-      issues: write        # GITHUB_TOKEN gets this automatically
+      issues: write
 
     steps:
-      - name: Create GitHub issue
-        id: create
+      - name: Sync Jira status to GitHub issue
         uses: actions/github-script@v7
         with:
           script: |
-            const payload = context.payload.client_payload;
+            const p = context.payload.client_payload;
+            const jiraKey  = p.jira_key;
+            const status   = p.status;      // "In Progress" / "To Do" / "Done" etc.
+            const summary  = p.summary;
+            const jiraUrl  = p.jira_url;
 
-            const issue = await github.rest.issues.create({
+            // Status → label mapping
+            const labelMap = {
+              "To Do":       "status:todo",
+              "In Progress": "status:in-progress",
+              "In Review":   "status:in-review",
+              "Done":        "status:done",
+              "Blocked":     "status:blocked"
+            };
+
+            const newLabel = labelMap[status] || "status:unknown";
+
+            // 1. Ensure all status labels exist in repo
+            const allLabels = Object.values(labelMap);
+            for (const label of allLabels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label,
+                  color: label.includes("in-progress") ? "0075ca"
+                       : label.includes("done")        ? "0e8a16"
+                       : label.includes("blocked")     ? "e11d48"
+                       : label.includes("todo")        ? "e4e669"
+                       : "cccccc"
+                });
+              } catch (e) { /* label already exists, skip */ }
+            }
+
+            // 2. Find existing GitHub issue by Jira key in title
+            const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo:  context.repo.repo,
-              title: `[${payload.jira_key}] ${payload.summary}`,
-              body: `## Jira Story: [${payload.jira_key}](${payload.jira_url})
-
-            **Summary:** ${payload.summary}
-            **Priority:** ${payload.priority}
-            **Reporter:** ${payload.reporter}
-
-            ---
-            *Auto-created when story moved to In Progress*`,
-              labels: ['jira-sync', 'in-progress']
+              state: "all",
+              per_page: 50
             });
 
-            console.log(`Created issue #${issue.data.number}`);
-            core.setOutput('issue_number', issue.data.number);
-            core.setOutput('issue_url', issue.data.html_url);
+            let issue = issues.data.find(i =>
+              i.title.startsWith(`[${jiraKey}]`)
+            );
 
-      - name: Link issue back to Jira
-        run: |
-          curl -s -X POST \
-            -u "${{ secrets.JIRA_USER_EMAIL }}:${{ secrets.JIRA_API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "${{ secrets.JIRA_BASE_URL }}/rest/api/3/issue/${{ github.event.client_payload.jira_key }}/remotelink" \
-            -d '{
-              "globalId": "github-issue-${{ steps.create.outputs.issue_number }}",
-              "object": {
-                "url": "${{ steps.create.outputs.issue_url }}",
-                "title": "GitHub Issue #${{ steps.create.outputs.issue_number }}",
-                "icon": { "url16x16": "https://github.com/favicon.ico" }
+            // 3a. If no issue exists and status is In Progress → create it
+            if (!issue && status === "In Progress") {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                title: `[${jiraKey}] ${summary}`,
+                body:  `## Jira Story: [${jiraKey}](${jiraUrl})\n**Summary:** ${summary}\n\n*Auto-created when story moved to In Progress*`,
+                labels: ["jira-sync", newLabel]
+              });
+              issue = created.data;
+              console.log(`Created issue #${issue.number}`);
+
+            // 3b. Issue exists → update label + add comment
+            } else if (issue) {
+
+              // Remove old status labels
+              const currentLabels = issue.labels.map(l => l.name);
+              for (const label of currentLabels) {
+                if (label.startsWith("status:")) {
+                  try {
+                    await github.rest.issues.removeLabel({
+                      owner: context.repo.owner,
+                      repo:  context.repo.repo,
+                      issue_number: issue.number,
+                      name: label
+                    });
+                  } catch(e) {}
+                }
               }
-            }'
+
+              // Add new status label
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issue.number,
+                labels: [newLabel]
+              });
+
+              // Add comment showing status change
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issue.number,
+                body: `🔄 **Jira status updated:** \`${p.from_status}\` → \`${status}\`\n\n*Synced from Jira at ${new Date().toISOString()}*`
+              });
+
+              // Close issue if Done
+              if (status === "Done") {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo:  context.repo.repo,
+                  issue_number: issue.number,
+                  state: "closed"
+                });
+                console.log(`Closed issue #${issue.number}`);
+              }
+
+              // Reopen issue if moved back from Done
+              if (status !== "Done" && issue.state === "closed") {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo:  context.repo.repo,
+                  issue_number: issue.number,
+                  state: "open"
+                });
+                console.log(`Reopened issue #${issue.number}`);
+              }
+
+              console.log(`Updated issue #${issue.number} → ${newLabel}`);
+            }
