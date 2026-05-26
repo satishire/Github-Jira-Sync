@@ -68,7 +68,7 @@ jobs:
                 repo:  context.repo.repo,
                 title: `[${jiraKey}] ${summary}`,
                 body:  `## Jira Story: [${jiraKey}](${jiraUrl})\n**Summary:** ${summary}\n\n*Auto-created when story moved to In Progress*`,
-                labels: ["jira-sync", newLabel]
+               // labels: ["jira-sync", newLabel]
               });
               issue = created.data;
               console.log(`Created issue #${issue.number}`);
